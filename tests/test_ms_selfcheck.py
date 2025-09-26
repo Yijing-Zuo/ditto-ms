@@ -2,7 +2,6 @@
 import torch
 from types import SimpleNamespace
 from inc.samp_ms import samp_ms
-from inc.diffus import SIR_STATES
 import collections
 
 import numpy as np

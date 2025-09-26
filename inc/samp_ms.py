@@ -149,8 +149,9 @@ def samp_ms(
                             invalid |= need_I
                         # 覆盖本节点排序坐标 (t, i) 的采样与对数概率
                         xI[t, i] = SIR_STATES.S
+			qi = qI[t, i, 0]
                         # qI[t, i] 形状为 (1,)，扩展到 (samples,)
-                        lI[t, i] = torch_log(qI[t, i].expand(n_samples))
+                        lI[t, i].fill_(float(torch_log(qi)))
                         # 强制发生时仍需 opt 通过；否则该样本 invalid
                         bad_no_opt = msk[u] & (~opt)
                         if bad_no_opt.any():
@@ -161,7 +162,8 @@ def samp_ms(
                         if need_I.any():
                             invalid |= need_I
                         xI[t, i] = SIR_STATES.I
-                        lI[t, i] = torch_log(1. - qI[t, i].expand(n_samples))
+			qi = qI[t, i, 0]
+                        lI[t, i].fill_(float(torch_log(1. - qi)))
                         # 不发生时，无需 opt（与原版一致：opt=False 时不会进入 toss）
                     else:
                         # 目标为 R：本步（I->S 阶段）无法直接达到 R,不可达
@@ -170,9 +172,9 @@ def samp_ms(
                 y[u] = torch.where(msk_opt, xI[t, i], y[u])
                 trs = (y[u] != SIR_STATES.I)# 是否发生了 I->S（= 正向新感染）
 
-                rem[u]   = torch.where(msk[u], torch.where(trs, rem[u] - 1, q_net.n_inf), rem[u])
+                rem[u]   = torch.where(msk[u], torch.where(trs, rem[u] - 1, q_net.n_inf[u].expand_as(rem[u])), rem[u])
                 rem[vid] = torch.where(msk[u].unsqueeze(0),
-                                       torch.where(trs.unsqueeze(0), rem[vid] - 1, q_net.n_inf),
+                                       torch.where(trs.unsqueeze(0), rem[vid] - 1, q_net.n_inf[vid],expand_as(rem[vid])),
                                        rem[vid])
                 #最终 msk[u] 仅保留“进入 toss 且 opt 通过”的样本（与原版一致）
                 msk[u] = msk_opt
