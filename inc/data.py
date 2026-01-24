@@ -2,7 +2,6 @@ from inc.diffus import *
 
 def data_make_t(y, x, dim = -1):
     return torch.where(*(y == x).max(dim), y.size(dim))
-
 def data_simulate(Gnx, seed, T, diffus, params):
     sir = (diffus == 'sir')
     cfg = ndmc.Configuration()
@@ -190,7 +189,7 @@ def data_covid_sir(data_dir, device):
     data_dir = osp.join(data_dir, 'covid')
     f_data = osp.join(data_dir, 'covid-sir.pt')
     if osp.exists(f_data):
-        return torch.load(f_data, map_location = device)
+        return torch.load(f_data, map_location=device)
     else:
         COVID_KNN = 10
         f_s2a = file_require(None, data_dir, 'state2abbr.pyon')
