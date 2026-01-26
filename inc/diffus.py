@@ -62,50 +62,94 @@ class BPar(nn.Module):
     def dict(self):
         return Dict(pI = self.pI.item(), pR = self.pR.item())
 
-def b_lik(bpar, data): # yT: (nodes,)
+def _mf_init_from_prior(data, n_nodes, device):
+    # prior: only use I0 count (same as current code)
+    I0 = (data.y[:, 0] == SIR_STATES.I).sum()
+    lI = torch.full((n_nodes,), I0 / n_nodes, dtype=torch.float, device=device)
+    lS = torch.full((n_nodes,), 1. - I0 / n_nodes, dtype=torch.float, device=device)
+    lR = torch.zeros(n_nodes, dtype=torch.float, device=device)
+    return lS, lI, lR
+
+def _mf_init_from_snapshot(y, device):
+    # hard clamp to observed snapshot y (nodes,)
+    lS = (y == SIR_STATES.S).float().to(device)
+    lI = (y == SIR_STATES.I).float().to(device)
+    lR = (y == SIR_STATES.R).float().to(device)
+    return lS, lI, lR
+
+def b_lik(bpar, data, obs_time=None):
     device = data.y.device
     n_nodes = data.num_nodes
     T = data.T.item()
     ei = data.edge_index
-    I0 = (data.y[:, 0] == 1).sum()
     pI, pR = bpar.pI, bpar.pR
-    lSs, lIs, lRs = [], [], []
-    lIs.append(torch.full((n_nodes,), I0 / n_nodes, dtype = torch.float, device = device))
-    lSs.append(torch.full((n_nodes,), 1. - I0 / n_nodes, dtype = torch.float, device = device))
-    lRs.append(torch.zeros(n_nodes, dtype = torch.float, device = device))
-    for t in range(T):
-        aI = pysc.scatter_mul(src = (1. - lIs[-1] * pI)[ei[0]], dim = 0, index = ei[1], dim_size = n_nodes)
-        lS = lSs[-1] * aI
-        kI = lIs[-1] + lSs[-1] * (1. - aI)
-        lI = kI * (1. - pR)
-        lR = lRs[-1] + kI * pR
-        lSs.append(lS)
-        lIs.append(lI)
-        lRs.append(lR)
-    lik = torch.stack([lSs[-1], lIs[-1], lRs[-1]], dim = 0) # (states, nodes)
-    yT = data.y[:, -1].unsqueeze(dim = 0) # (1, nodes)
-    lik = lik.gather(dim = 0, index = yT) # (1, nodes)
-    lik = torch_log(lik).mean()
-    return lik
 
-def b_estim(data, args):
+    # -------- obs times --------
+    if obs_time is None:
+        obs_time = [T]
+    obs_time = sorted(set(int(t) for t in obs_time if 0 <= int(t) <= T))
+    if len(obs_time) == 0 or obs_time[-1] != T:
+        obs_time.append(T)
+
+    # -------- segmented mean-field --------
+    lS, lI, lR = _mf_init_from_prior(data, n_nodes, device)
+    t_prev = 0
+    lik_total = 0.0
+
+    for t_obs in obs_time:
+        # forward from t_prev -> t_obs
+        for _ in range(t_obs - t_prev):
+            aI = pysc.scatter_mul(
+                src=(1. - lI * pI)[ei[0]],
+                dim=0,
+                index=ei[1],
+                dim_size=n_nodes
+            )
+            lS_new = lS * aI
+            kI = lI + lS * (1. - aI)
+            lI_new = kI * (1. - pR)
+            lR_new = lR + kI * pR
+            lS, lI, lR = lS_new, lI_new, lR_new
+
+        # score snapshot at t_obs
+        lik = torch.stack([lS, lI, lR], dim=0)               # (3, nodes)
+        y = data.y[:, t_obs].unsqueeze(dim=0)                # (1, nodes)
+        prob = lik.gather(dim=0, index=y).squeeze(dim=0)     # (nodes,)
+        lik_total = lik_total + torch_log(prob).mean()
+
+        # clamp for next segment (if any)
+        lS, lI, lR = _mf_init_from_snapshot(data.y[:, t_obs], device)
+        t_prev = t_obs
+
+    # optional: normalize by number of observed frames, keeps loss scale stable
+    lik_total = lik_total / len(obs_time)
+    return lik_total
+
+def b_estim(data, args, obs_time=None):
     T = data.T.item()
-    n_nodes = data.num_nodes
-    n_edges = data.edge_index.size(dim = 1)
     n_cls = data.y[:, T].max().item() + 1
     pI, pR = args.b_pI0, (args.b_pR0 if n_cls == 3 else 0.)
-    #print(f'[ini] pI={pI:.4f}, pR={pR:.4f}', flush = True)
     device = data.y.device
-    bpar = BPar(pI = pI, pR = pR, device = device)
+
+    # if caller doesn't pass obs_time, parse from args (compatible with current main)
+    if obs_time is None and hasattr(args, "obs_time"):
+        tmp = [int(t) for t in str(args.obs_time).split(',') if t]
+        tmp.append(T)
+        obs_time = tmp
+
+    bpar = BPar(pI=pI, pR=pR, device=device)
     bpar.train()
-    opt = optim.AdamW(bpar.parameters(), lr = args.b_lr, betas = (0.5, 0.5))
+    opt = optim.AdamW(bpar.parameters(), lr=args.b_lr, betas=(0.5, 0.5))
     pbar = trange(1, args.b_steps + 1)
+
     for step in pbar:
         opt.zero_grad()
-        loss = -b_lik(bpar, data)
+        loss = -b_lik(bpar, data, obs_time=obs_time)
         loss.backward()
         opt.step()
         bpar.clamp_()
         pbar.set_description(f'[step={step}] {bpar}')
+
     bpar.eval()
     return bpar.dict()
+

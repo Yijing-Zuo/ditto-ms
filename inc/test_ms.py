@@ -58,13 +58,13 @@ def test_skm(skm_fn, data, y_pred, **kwargs):
 
 @torch.no_grad()
 def test_nrmse(data, y_pred):
-    y_fixed = test_fix_obs(data, y_pred)
-    tI_pred = data_make_tI(y_fixed, dim=-1)
+    y_pred = test_fix_obs(data, y_pred)
+    tI_pred = data_make_t(y_pred, SIR_STATES.I, dim = -1)
     mse = skm.mean_squared_error(torch2np(data.tI), torch2np(tI_pred))
     if hasattr(data, 'tR'):
-        tR_pred = data_make_t(y_fixed, SIR_STATES.R, dim=-1)
+        tR_pred = data_make_t(y_pred, SIR_STATES.R, dim = -1)
         mseR = skm.mean_squared_error(torch2np(data.tR), torch2np(tR_pred))
-        mse = (mse + mseR) / 2.0
+        mse = (mse + mseR) / 2.
     nrmse = np.sqrt(mse) / (data.T.item() + 1)
     return float(nrmse)
 

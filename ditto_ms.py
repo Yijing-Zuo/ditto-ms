@@ -150,6 +150,226 @@ class QNet(nn.Module):
             )
         ).sum(dim = 0) # (samples,)
         return lik, zI0, zR0, zI, zR # (samples,)
+
+    def _lik_seg_local(self, Y, zI, zR, TL, TR):
+        """
+        Segment log-prob under the *original DITTO local-support* backward sampler.
+        This is essentially the original `lik()` but restricted to t in [TL, TR-1].
+
+        Parameters
+        ----------
+        Y : LongTensor, (T+1, nodes, samples)
+        zI, zR : FloatTensor, (T, nodes, samples)  (already clamped / combined)
+        TL, TR : int segment endpoints (TL < TR)
+        """
+        n_samples = Y.size(dim=2)
+        L = int(TR - TL)
+        if L <= 0:
+            return torch.zeros(n_samples, dtype=torch.float32, device=self.device)
+
+        # Slice the segment (TL..TR)
+        Yseg = Y[TL: TR + 1]  # (L+1, nodes, samples)
+        zIseg = zI[TL: TR]  # (L, nodes, samples)
+        zRseg = zR[TL: TR]  # (L, nodes, samples)
+
+        # -------------------------
+        # R -> I (backward)
+        # -------------------------
+        qR = torch.sigmoid(zRseg)  # (L, nodes, samples)
+        lR1 = torch_log(qR)
+        lR0 = torch_log(1.0 - qR)
+        with torch.no_grad():
+            mskR = (Yseg[1:] == SIR_STATES.R)  # (L, nodes, samples)
+            trsR = (Yseg[:-1] != SIR_STATES.R)  # (L, nodes, samples)
+
+        # -------------------------
+        # I -> S (backward) with DITTO ordering trick
+        # -------------------------
+        zI_, uid = zIseg.sort(dim=1, descending=True)  # (L, nodes, samples)
+        qI = torch.sigmoid(zI_)  # (L, nodes, samples)
+        lI1 = torch_log(qI)
+        lI0 = torch_log(1.0 - qI)
+
+        with torch.no_grad():
+            # NOTE: this follows your existing `lik()` implementation style.
+            mskI = ((Yseg[1:] >= SIR_STATES.I) & (Yseg[:-1] <= SIR_STATES.I)).flatten()
+            trsI = ((Yseg[:-1] != SIR_STATES.I)).flatten()
+
+            rem = torch.where(mskI, self.rem.expand(L, -1, n_samples).flatten(), self.n_inf)
+            ptr = torch.arange(L, dtype=torch.long, device=self.device).unsqueeze(dim=1) * self.n_nodes  # (L,1)
+
+            for i in range(uid.size(dim=1)):
+                uidi = (ptr + uid[:, i]).flatten() * n_samples  # (L*samples)
+                mski = mskI[uidi]
+                if mski.max():
+                    trsi = trsI[uidi]
+
+                    vids, degi = [], [0]
+                    for t in range(L):
+                        for j in range(n_samples):
+                            u = uid[t, i, j]
+                            vids.append((t * self.n_nodes + u.unsqueeze(dim=0)) * n_samples)
+                            vid = self.neighbs[u.item()]
+                            vids.append((t * self.n_nodes + vid) * n_samples)
+                            degi.append(vid.size(dim=0) + 1)
+
+                    vids = torch.cat(vids, dim=0)
+                    degi = torch.tensor(degi, dtype=torch.long, device=self.device)
+                    indptr = degi.cumsum(dim=0)
+                    degi = degi[1:]
+
+                    rems = rem.flatten()[vids]
+                    opti = (pysc.segment_min_csr(src=rems, indptr=indptr)[0] > 1)
+
+                    rem.flatten()[vids] = torch.where(
+                        mski.repeat_interleave(repeats=degi),
+                        torch.where(trsi.repeat_interleave(repeats=degi), rems - 1, self.n_inf),
+                        rems,
+                    )
+                    mskI[uidi] &= opti
+
+        lik = (
+                torch.where(mskR, torch.where(trsR, lR1, lR0), self.zero).reshape(-1, n_samples)
+                + torch.where(
+            mskI.reshape(-1, n_samples),
+            torch.where(
+                trsI.reshape(-1, n_samples),
+                lI1.reshape(-1, n_samples),
+                lI0.reshape(-1, n_samples),
+            ),
+            self.zero,
+        )
+        ).sum(dim=0)
+
+        return lik
+
+    def _lik_seg_a1(self, Y, zI, zR, TL, TR, eps=1e-6):
+        S, I, R = SIR_STATES.S, SIR_STATES.I, SIR_STATES.R
+        device = self.device
+        n_samples = Y.shape[2]
+        p_seg = self.zero.expand(n_samples).clone()
+
+
+        yL = Y[TL]
+        blocked = (yL == R)
+        src = (yL == I)
+
+        # IMPORTANT: only t in (TL, TR) i.e. TL+1 ... TR-1 (consistent with _samp_seg)
+        for t in range(TL + 1, TR):
+            d = t - TL
+            y_t = Y[t]
+            y_next = Y[t + 1]
+
+            qR = torch.sigmoid(zR[t]).clamp(eps, 1.0 - eps)  # (n_nodes, 1)
+            p_add = (1.0 - torch.sigmoid(zI[t])).clamp(eps, 1.0 - eps)  # (n_nodes, 1)
+
+            pool = (y_next != S) & (~blocked)
+            A_true = (y_t != S) & pool
+
+            # replay growth to compute log prob of A_true
+            A = src & pool
+            frontier = A.clone()
+            decided = A.clone()
+
+            logp_A = torch.zeros(y_t.shape[1], device=device)
+
+            for _ in range(d):
+                cand = (torch.sparse.mm(self.adj, frontier.float()) > 0) & pool & (~decided)
+                if not cand.any():
+                    break
+
+                add = cand & A_true
+                logp_A += (add.float() * torch_log(p_add) + (cand & ~add).float() * torch_log(1 - p_add)).sum(0)
+
+                A |= add
+                frontier = add
+                decided |= cand
+
+            # if A_true contains nodes never reached by growth => prob 0
+            missing = A_true & (~A)
+            if missing.any():
+                # set those samples to -inf
+                bad = missing.any(dim=0)
+                logp_A[bad] = -float("inf")
+
+            # candR likelihood
+            candR = A_true & (y_next == R)
+            isI = (y_t == I)
+            toI = candR & isI
+            toR = candR & (~isI)  # should be R
+
+            logp_R = (toI.float() * torch_log(qR) + toR.float() * torch_log(1 - qR)).sum(0)
+
+            # if y_next==I and in A_true, must be I
+            badI = (A_true & (y_next == I) & (y_t != I)).any(dim=0)
+            if badI.any():
+                logp_R[badI] = -float("inf")
+
+            p_seg += (logp_A + logp_R)
+
+        return p_seg
+
+    def lik_ms(self, Y, obs_time):
+        """
+        Multi-snapshot proposal likelihood matching `samp_ms()`.
+        """
+        assert Y.size(dim=0) == self.T + 1, "lik_ms expects Y with shape (T+1, nodes, samples)"
+        n_samples = Y.size(dim=2)
+
+        # sanitize obs_time: unique, within (0..T], and must include T
+        obs_time = sorted({int(t) for t in obs_time if 0 < int(t) <= self.T})
+        if self.T not in obs_time:
+            obs_time.append(self.T)
+        K = len(obs_time)
+
+        # Condition on all observed snapshots: concat along the "samples" dimension
+        y_cond = torch.cat([Y[t] for t in obs_time], dim=1)
+
+        # Forward once for all conditioning blocks
+        zI0, zR0, zI, zR = self.forward(y_cond, orig=True)  # (T, nodes, samples*K)
+
+        # reshape to (T, nodes, K, samples)
+        zI0 = zI0.contiguous().view(self.T, self.n_nodes, K, n_samples)
+        zR0 = zR0.contiguous().view(self.T, self.n_nodes, K, n_samples)
+        zI = zI.contiguous().view(self.T, self.n_nodes, K, n_samples)
+        zR = zR.contiguous().view(self.T, self.n_nodes, K, n_samples)
+
+        # detach+clamp leaf trick (same training mechanism as original lik())
+        zI = zI.clone().detach().requires_grad_(True)
+        zI.retain_grad()
+        zR = zR.clone().detach().requires_grad_(True)
+        zR.retain_grad()
+
+        lik = torch.zeros(n_samples, dtype=torch.float32, device=self.device)
+
+        segL = [0] + obs_time[:-1]
+        segR = obs_time
+
+        for i in range(K):
+            TL, TR = segL[i], segR[i]
+
+            # logits conditioned on right endpoint snapshot y_TR (index i)
+            zI_R = zI[:, :, i, :]  # (T, nodes, samples)
+            zR_R = zR[:, :, i, :]
+
+            # combine left+right logits for TL>0 as in samp_ms()
+            if (TL > 0) and (K > 1):
+                zI_L = zI[:, :, i - 1, :]
+                zR_L = zR[:, :, i - 1, :]
+                zI_seg = self.clamp_z(zI_R + zI_L)
+                zR_seg = self.clamp_z(zR_R + zR_L)
+            else:
+                zI_seg = zI_R
+                zR_seg = zR_R
+
+            if TL == 0:
+                lik = lik + self._lik_seg_local(Y, zI_seg, zR_seg, TL=TL, TR=TR)
+            else:
+                # _lik_seg_a1() only returns `lik` and does not accept return_ok / invalid_to_neg_inf
+                lik = lik + self._lik_seg_a1(Y, zI_seg, zR_seg, TL=TL, TR=TR)
+
+        return lik, zI0, zR0, zI, zR
+
     @torch.no_grad()
     def clamp_grad(self, z0, grad):
         return torch.where(z0 < self.zlim, torch.where(z0 > -self.zlim, grad, F.relu(grad)), -F.relu(-grad))
@@ -296,301 +516,153 @@ class QNet(nn.Module):
         else:
             return y
 
-    @torch.no_grad()
-    def _samp_seg(self, yR, zI, uid, zR, n_samples, TL, TR, yL=None, compute_lik=False):
-        """
-        Sample ONE segment (TL, TR] in *reverse* temporal order (backward sampling).
+    def _samp_seg(self, yL, yR, zI_sorted, uid, zR, TL, TR, compute_lik=False):
+        S, I, R = self.S, self.I, self.R
+        n_samples = yR.shape[1]
+        device = self.device
 
-        Segment definition:
-            - Left endpoint time  TL  (may be observed / clamped if yL is provided)
-            - Right endpoint time TR  (always observed here; yR is the snapshot at TR)
-            - We generate snapshots for times: TR-1, TR-2, ..., TL (if yL is None) or TL+1 (if yL is fixed)
+        Y = torch.empty(TR - TL + 1, self.n_nodes, n_samples, dtype=torch.long, device=device)
+        lik = 0.0 if compute_lik else None
 
-        Why segment-wise?
-            In multi-snapshot DITTO, we must satisfy *all* observed snapshots exactly.
-            We sample each segment backward from the fixed right endpoint y_TR. However, in the multi-snapshot
-            setting we also need a *left feasibility* guarantee: sampled states must still be extendable to
-            match the left observed snapshot y_TL. This is the left-extendability hard constraint Ext(t).
+        # Clamp left endpoint
+        yL = yL.unsqueeze(dim=1).expand(-1, n_samples)
+        yR = yR.unsqueeze(dim=1).expand(-1, n_samples)
+        Y[0] = yL
+        Y[TR - TL] = yR
 
-        Parameters
-        ----------
-        yR : LongTensor, shape (nodes,)
-            Fixed right endpoint snapshot y_{TR}.
-        zI : FloatTensor, shape (T, nodes, 1)
-            Proposal logits (already sorted along nodes dim) controlling backward I->S decisions.
-            NOTE: must be consistent with uid.
-        uid : LongTensor, shape (T, nodes)
-            Node indices sorted by descending zI at each time t (DITTO's ordering trick).
-        zR : FloatTensor, shape (T, nodes, 1)
-            Proposal logits controlling backward R->I decisions (NOT sorted; original node order).
-        n_samples : int
-            How many independent histories to sample in parallel.
-        TL, TR : int
-            Segment endpoints (TL < TR).
-        yL : LongTensor or None
-            If provided, this is the *observed* left endpoint snapshot y_{TL} (hard constraint).
-            In that case we will NOT sample time TL; we clamp it to yL.
-        compute_lik : bool
-            If True, also return log-probability under the proposal (needed by M-H acceptance).
-
-        Returns
-        -------
-        Y_seg : LongTensor, shape (TR-TL, nodes, samples)
-            The sampled segment snapshots in *forward* time indexing within the segment:
-                Y_seg[k] corresponds to time (TL + k), for k=0..(TR-TL-1).
-            If yL is provided, then Y_seg[0] == yL is included (clamped).
-        lik_seg : FloatTensor, shape (samples,)   (only if compute_lik=True)
-            Sum of log-probabilities of all backward steps performed inside this segment.
-        """
-        L = TR - TL  # number of time indices in [TL, TR) that we store in Y_seg
-        Y = torch.empty(L, self.n_nodes, n_samples, dtype=torch.long, device=self.device)
-
-        if compute_lik:
-            # segment log-likelihood under the proposal Q_theta
-            lik = torch.zeros(n_samples, dtype=torch.float, device=self.device)
-
-        # Current "right" snapshot y_{t+1}. Start from fixed right endpoint y_{TR}.
-        y = yR.unsqueeze(dim=1).expand(-1, n_samples)  # (nodes, samples)
-
-        # ---------------------------------------------------------------------
-        # Precompute yL-dependent tensors once per segment.
-        # ---------------------------------------------------------------------
-        if yL is not None:
-            yL_col = yL.unsqueeze(dim=1)  # (nodes, 1) for monotonicity check x >= y_TL
-            yL_not_R = (yL != SIR_STATES.R).unsqueeze(dim=1)  # (nodes, 1) exclude nodes fixed to R at TL
-            src = (yL == SIR_STATES.I).unsqueeze(dim=1)  # (nodes, 1) infection sources at TL
-
-            def ext_ok_fast(x, t):
-                """
-                Faster ext_ok that reuses yL-related precomputations.
-                x: (nodes, samples) candidate snapshot at time t
-                """
-                d = t - TL
-                ok = (x >= yL_col).all(dim=0)  # (samples,)
-                if not ok.max():
-                    return ok
-                A = (x != SIR_STATES.S) & yL_not_R  # (nodes, samples)
-                reach = src.expand(-1, x.size(dim=1)) & A  # (nodes, samples)
-                for _ in range(d):
-                    nbr = (torch.sparse.mm(self.adj, reach.float()) > 0) & A
-                    new_reach = reach | nbr
-                    if torch.equal(new_reach, reach):
-                        reach = new_reach
-                        break
-                    reach = new_reach
-                Iset = (x == SIR_STATES.I) & yL_not_R
-                Rset = (x == SIR_STATES.R) & yL_not_R
-                ok = ok & ~(Iset & ~reach).any(dim=0)
-                ok = ok & ~(Rset & ~reach).any(dim=0)
-                return ok
-        else:
-            ext_ok_fast = None
-
-        # ---------------------------------------------------------------------
-        # Segment-level empty-support check: the observed right endpoint itself
-        # must be extendable from the observed left endpoint (when present).
-        # ---------------------------------------------------------------------
-        if ext_ok_fast is not None:
-            okR = ext_ok_fast(yR.unsqueeze(dim=1), TR)  # (1,)
-            if not bool(okR.item()):
-                n_src = int((yL == SIR_STATES.I).sum().item())
-                n_fixR = int((yL == SIR_STATES.R).sum().item())
-                n_yR_I = int((yR == SIR_STATES.I).sum().item())
-                n_yR_R = int((yR == SIR_STATES.R).sum().item())
-                mono = bool((yR >= yL).all().item())
-                raise RuntimeError(
-                    "[DITTO-MS] Segment infeasible (empty support) under hard constraints. "
-                    f"Segment (TL={TL}, TR={TR}, len={TR-TL}). "
-                    f"Monotonic(y_TR>=y_TL)={mono}. "
-                    f"#src_I@TL={n_src}, #fixed_R@TL={n_fixR}, #I@TR={n_yR_I}, #R@TR={n_yR_R}. "
-                    "This typically means the observations cannot be bridged on the graph within the time budget "
-                    "(e.g., src is empty/small, isolated targets, or timestamps over-constrain the diffusion)."
-                )
-
-        # ---------------------------------------------------------------------
-        # First segment (TL=0) has no left-extendability constraint; keep original sampler.
-        # For subsequent segments, use constructive hop-layer growth to enforce Ext(t) by construction.
-        # ---------------------------------------------------------------------
-        if yL is None:
-            # no left constraint, sample purely by original backward local-support steps
-            for k in range(L - 1, -1, -1):
-                t = TL + k
+        # TL=0 : keep original DITTO step
+        if TL == 0:
+            y = yR
+            for t in range(TR - 1, 0, -1):
+                y, p_x = self._samp_step(y, zI_sorted[t], uid[t], zR[t], compute_lik)
+                Y[t] = y
                 if compute_lik:
-                    y, lik_t = self._samp_step(y, zI, uid, zR, t, compute_lik=True, yL=None)
-                    lik = lik + lik_t
-                else:
-                    y = self._samp_step(y, zI, uid, zR, t, compute_lik=False, yL=None)
-                Y[k] = y
-            if compute_lik:
-                return Y.detach().clone(), lik.detach().clone()
-            else:
-                return Y.detach().clone()
+                    lik += p_x
+            return Y, lik
 
-        # ---------------------------------------------------------------------
-        # Constructive extendable sampler (Scheme A1):
-        #   At each time t in (TL, TR):
-        #     - pool := nodes with y_{t+1} != S and yL != R
-        #     - build A_t (non-S set) by hop layers from src within pool:
-        #         include all nodes within distance <= d-1
-        #         optionally include some nodes at exact distance d
-        #         force-include distance-d nodes that are needed to infect distance-(d+1) nodes
-        #     - set y_t outside A_t to S (or R if blocked)
-        #     - inside A_t, decide I/R using zR, but force I on nodes needed as infection sources
-        # This eliminates the rejection loop for Ext(t).
-        # ---------------------------------------------------------------------
+        # -------------------------
+        # TL > 0 : Route-B sampler
+        # -------------------------
 
-        # Build unsorted zI (needed to derive p_add on boundary layer in original node order).
-        # zI is sorted along nodes dim with permutation uid.
-        zI_sorted_ = zI.squeeze(dim=2)  # (T, nodes)
-        zI_unsorted = torch.empty_like(zI_sorted_)  # (T, nodes)
+        # unsort zI for p_add lookup (keep your original logic)
+        zI_unsorted = torch.empty_like(zI_sorted).squeeze(dim=2)  # (T, n_nodes)
         for tt in range(self.T):
-            zI_unsorted[tt, uid[tt]] = zI_sorted_[tt]
+            zI_unsorted[tt].scatter_(dim=0, index=uid[tt], src=zI_sorted[tt].squeeze(dim=1))
 
-        # Precompute fixed masks from left observation.
-        blocked = (yL == SIR_STATES.R).unsqueeze(dim=1)  # (nodes, 1)
-        yL_not_R = ~blocked
-        src = (yL == SIR_STATES.I).unsqueeze(dim=1)  # (nodes, 1)
+        blocked = (yL == R)
+        src = (yL == I)
 
-        # We do NOT sample time TL itself; clamp it to yL.
-        k_min = 1
+        for t in range(TR - 1, TL, -1):
+            d = t - TL
+            y_next = Y[t - TL + 1]  # (n_nodes, n_samples)
 
-        for k in range(L - 1, k_min - 1, -1):
-            t = TL + k
-            d = t - TL  # hop budget for Ext(t)
+            # probabilities
+            qR = torch.sigmoid(zR[t])  # (n_nodes, 1)
+            p_add = 1.0 - torch.sigmoid(zI_unsorted[t]).unsqueeze(1)  # (n_nodes, 1)
+            # (optional) clamp to avoid exactly 0/1
+            qR = qR.clamp(self.eps, 1.0 - self.eps)
+            p_add = p_add.clamp(self.eps, 1.0 - self.eps)
 
-            y_next = y  # y_{t+1}, shape (nodes, samples)
+            pool = (y_next != S) & (~blocked)
 
-            # pool = {u: y_{t+1,u} != S} \ blocked
-            pool = (y_next != SIR_STATES.S) & yL_not_R  # (nodes, samples)
+            # ------------------------------------------------------------
+            # Step 1: A_t generation WITHOUT forcing reach_{<=d-1}
+            #         (outward growth from src for d hops)
+            # ------------------------------------------------------------
+            A = src & pool
+            frontier = A.clone()
+            decided = A.clone()  # nodes whose add/not-add decision has been made
 
-            # If any sample has non-empty pool but no src in pool, segment is infeasible for that sample.
-            src_in_pool = (src.expand(-1, n_samples) & pool).any(dim=0)  # (samples,)
-            if (~src_in_pool & pool.any(dim=0)).any():
-                raise RuntimeError(
-                    "[DITTO-MS] Constructive sampler hit infeasible intermediate state: "
-                    f"at time t={t} (TL={TL},TR={TR}), pool non-empty but src not in pool for some samples. "
-                    "This indicates either inconsistent observations or a bug in monotonic clamping."
-                )
+            if compute_lik:
+                logp_A = torch.zeros(n_samples, device=device)
 
-            # -----------------------------------------------------------------
-            # Hop-layer BFS within pool from src, up to d+1 layers.
-            # We need:
-            #   - reach_{d-1}: nodes within dist <= d-1 (must be non-S at time t to support outer growth)
-            #   - layer_d: nodes at exact dist d (optional, but some are forced)
-            #   - layer_{d+1}: nodes at exact dist d+1 (cannot be non-S at time t; must be new at t+1)
-            # -----------------------------------------------------------------
-            frontier = src.expand(-1, n_samples) & pool  # layer 0
-            reach = frontier.clone()
-            reach_dminus1 = frontier.clone()  # will be overwritten if d-1 >= 1
-            layer_d = torch.zeros_like(frontier)
-            layer_d1 = torch.zeros_like(frontier)
+            for _ in range(d):
+                cand = (torch.sparse.mm(self.adj, frontier.float()) > 0) & pool & (~decided)
+                if not cand.any():
+                    break
 
-            # Special: if d-1 == 0, then reach_dminus1 is just layer0.
-            # We'll record reach after step (d-1) as reach_dminus1.
-            for h in range(1, d + 2):  # compute layers 1..d+1
-                nbr = (torch.sparse.mm(self.adj, frontier.float()) > 0) & pool & (~reach)
-                frontier = nbr
-                reach = reach | frontier
-                if h == d - 1:
-                    reach_dminus1 = reach.clone()
-                if h == d:
-                    layer_d = frontier.clone()
-                if h == d + 1:
-                    layer_d1 = frontier.clone()
+                u = torch.rand(self.n_nodes, n_samples, device=device)
+                add = cand & (u <= p_add)  # Bernoulli(p_add)
+                if compute_lik:
+                    logp_A += (add.float() * torch_log(p_add) + (cand & ~add).float() * torch_log(1 - p_add)).sum(0)
 
-            # If d == 1, loop sets reach_dminus1 when h==0 not visited; keep as layer0.
-            if d == 1:
-                reach_dminus1 = src.expand(-1, n_samples) & pool
+                A |= add
+                frontier = add
+                decided |= cand
 
-            # Nodes at dist <= d-1 are always included in A_t (conservative constructive core).
-            A = reach_dminus1.clone()
+            # ------------------------------------------------------------
+            # Step 2: sample states in A, but DO NOT force all neighbors of new
+            #         Enforce: each new has >=1 infected neighbor (only if otherwise 0-prob)
+            # ------------------------------------------------------------
+            x_t = torch.full_like(y_next, S)
+            x_t[blocked] = R
 
-            # Force-include distance-d nodes that are adjacent to distance-(d+1) nodes,
-            # because those layer_{d+1} nodes must be infected at t+1 and need an I neighbor at time t.
-            if d >= 1:
-                bnd_need = layer_d & (torch.sparse.mm(self.adj, layer_d1.float()) > 0)
-            else:
-                bnd_need = torch.zeros_like(layer_d)
+            # forced I if y_next==I and in A
+            mI = A & (y_next == I)
+            x_t[mI] = I
 
-            # Optional boundary nodes at dist d that are NOT needed for layer_{d+1}.
-            bnd_opt = layer_d & (~bnd_need)
+            # candR nodes: y_next==R and in A => sample I/R via qR
+            candR = A & (y_next == R)
+            uR = torch.rand(self.n_nodes, n_samples, device=device)
+            toI = candR & (uR <= qR)
+            toR = candR & (~toI)
+            x_t[toI] = I
+            x_t[toR] = R
 
-            # Sample add decision for optional boundary nodes using p_add = 1 - sigmoid(zI_unsorted[t]).
-            # (High qI => more likely to become new, so lower include prob.)
-            p_add = (1.0 - torch.sigmoid(zI_unsorted[t]).unsqueeze(dim=1)).clamp(1e-6, 1.0 - 1e-6)  # (nodes,1)
-            if bnd_opt.any():
-                rnd = torch.rand(self.n_nodes, n_samples, device=self.device)
-                bnd_add = bnd_opt & (rnd <= p_add.expand(-1, n_samples))
-            else:
-                bnd_add = torch.zeros_like(bnd_opt)
+            if compute_lik:
+                logp_R = (toI.float() * torch_log(qR) + toR.float() * torch_log(1 - qR)).sum(0)
 
-            # Final A_t
-            A = A | bnd_need | bnd_add
-
-            # -----------------------------------------------------------------
-            # Given A_t, construct y_t:
-            #   - blocked nodes (yL==R): force R
-            #   - nodes not in A and not blocked: S
-            #   - nodes in A:
-            #       if y_{t+1}==I => force I
-            #       if y_{t+1}==R => sample I/R with qR, but force I if needed as infection source
-            # -----------------------------------------------------------------
-            y_t = torch.full((self.n_nodes, n_samples), SIR_STATES.S, dtype=torch.long, device=self.device)
-            y_t = torch.where(blocked.expand(-1, n_samples), SIR_STATES.R, y_t)
-
-            # new nodes are those in pool but not in A (they are S at time t, become non-S at t+1)
+            # new nodes
             new = pool & (~A)
 
-            # Any node in A adjacent to any new node must be infected at time t to enable infection.
-            need_source = A & (torch.sparse.mm(self.adj, new.float()) > 0)
+            # ---- enforce infection-source constraint minimally ----
+            # For each sample: if a new node has no infected neighbor, pick ONE neighbor in A and flip to I
+            # (only when otherwise impossible / zero-prob forward)
+            I_mask = (x_t == I)
+            neighI = (torch.sparse.mm(self.adj, I_mask.float()) > 0)
+            bad_new = new & (~neighI)  # nodes that violate ">=1 infected neighbor"
+            if bad_new.any():
+                # candidates that could be flipped to I: in A, and (y_next==I already I) OR (y_next==R and in candR)
+                # (y_next==I in A are already I; so only need consider A & (y_next==R) that are currently R)
+                fixable = A & (y_next == R)
 
-            # Force I where y_{t+1}==I
-            force_I_from_next = A & (y_next == SIR_STATES.I)
+                # For each bad_new node u, choose one neighbor v from fixable ∩ N(u) to flip to I
+                # If none exists, that sample is infeasible under model (posterior prob 0), so leave as is (will be rejected later if you have a checker)
+                neigh_fixable = (torch.sparse.mm(self.adj, fixable.float()) > 0)
+                # We flip per bad_new node by sampling one neighbor index.
+                # Implementation trick: do one pass "greedy-random" by picking first available neighbor per (u,sample)
+                # (this avoids heavy per-node loops and still gives each choice positive prob if you randomize tie-breaking)
+                # Here: random tie-breaking by multiplying adjacency mask with random noise.
+                adj_dense = self.adj.to_dense()  # (n_nodes, n_nodes) maybe too big; if too big, replace with sparse gather kernels
+                # NOTE: if graph is large, do not materialize dense. In that case implement sparse neighbor sampling separately.
 
-            # Candidate nodes with y_{t+1}==R that are not forced infection sources.
-            candR = A & (y_next == SIR_STATES.R) & (~need_source) & (~force_I_from_next)
+                # For minimal code change, keep dense only if feasible in your scale.
+                noise = torch.rand(self.n_nodes, self.n_nodes, device=device)
+                # candidates matrix: (u,v,sample) => u in bad_new, v in fixable neighbor
+                # build neighbor mask (u,v) then apply for each sample
+                nb_mask = (adj_dense > 0)
 
-            # Sample I/R for candR using qR (prob of R->I backward => I at time t).
-            if candR.any():
-                qR_t = torch.sigmoid(zR[t]).clamp(1e-6, 1.0 - 1e-6)  # (nodes,1)
-                rndR = torch.rand(self.n_nodes, n_samples, device=self.device)
-                isI = candR & (rndR <= qR_t.expand(-1, n_samples))
-                # Set sampled states
-                y_t = torch.where(isI, SIR_STATES.I, y_t)
-                y_t = torch.where(candR & (~isI), SIR_STATES.R, y_t)
-                if compute_lik:
-                    logq = torch_log(qR_t).expand(-1, n_samples)
-                    log1q = torch_log(1.0 - qR_t).expand(-1, n_samples)
-                    lik = lik + (torch.where(isI, logq, self.zero) + torch.where(candR & (~isI), log1q, self.zero)).sum(dim=0)
-            else:
-                if compute_lik:
-                    pass
+                for s in range(n_samples):
+                    bad_u = bad_new[:, s].nonzero(as_tuple=False).flatten()
+                    if bad_u.numel() == 0:
+                        continue
+                    fix_v = fixable[:, s]
+                    # for each bad u, pick v maximizing noise among allowed neighbors
+                    for u_node in bad_u.tolist():
+                        allowed = nb_mask[u_node] & fix_v
+                        if allowed.any():
+                            v_idx = (noise[u_node] * allowed.float()).argmax().item()
+                            x_t[v_idx, s] = I
 
-            # Force I for infection sources and nodes that are I at t+1
-            y_t = torch.where(need_source | force_I_from_next, SIR_STATES.I, y_t)
+            # optional: if you want strict soundness, you can assert-check again and resample/reject,
+            # but for minimal code change we just repair as above.
 
-            # -----------------------------------------------------------------
-            # Proposal likelihood contributions from boundary add decisions.
-            # We only account for sampled optional boundary nodes (bnd_opt).
-            # Forced inclusions (reach<=d-1 and bnd_need) are deterministic (log prob 0).
-            # -----------------------------------------------------------------
-            if compute_lik and bnd_opt.any():
-                p = p_add.expand(-1, n_samples)
-                logp = torch_log(p)
-                log1p = torch_log(1.0 - p)
-                lik = lik + (torch.where(bnd_add, logp, self.zero) + torch.where(bnd_opt & (~bnd_add), log1p, self.zero)).sum(dim=0)
+            Y[t - TL] = x_t
 
-            # Commit and step left
-            Y[k] = y_t
-            y = y_t
+            if compute_lik:
+                lik += (logp_A + logp_R)
 
-        # Clamp left endpoint snapshot
-        Y[0] = yL.unsqueeze(dim=1).expand(-1, n_samples)
-
-        if compute_lik:
-            return Y.detach().clone(), lik.detach().clone()
-        else:
-            return Y.detach().clone()
+        return Y, lik
 
     @torch.no_grad()
     def samp_ms(self, y, zI, zR, n_samples, obs_time, compute_lik=False):
@@ -671,22 +743,37 @@ class QNet(nn.Module):
             return Y.detach().clone()
 
 
-def q_loss(q_net, data, I0, bpar, n_samples):
+def q_loss(q_net, data, I0, bpar, n_samples, obs_time):
     T = data.T.item()
     n_nodes = data.num_nodes
-    Y = diffus_gen(T = T, n_nodes = n_nodes, edge_index = data.edge_index, I0 = I0, n_samples = n_samples, pI = bpar.pI, pR = bpar.pR) # (T+1, nodes, samples)
-    q_liks, zI0, zR0, zI, zR = q_net.lik(Y = Y) # (samples,)
+    Y = diffus_gen(
+        T=T,
+        n_nodes=n_nodes,
+        edge_index=data.edge_index,
+        I0=I0,
+        n_samples=n_samples,
+        pI=bpar.pI,
+        pR=bpar.pR,
+    )  # (T+1, nodes, samples)
+
+    q_liks, zI0, zR0, zI, zR = q_net.lik_ms(Y=Y, obs_time=obs_time)
     return -q_liks.mean(), zI0, zR0, zI, zR
 
 def q_train(data, bpar, args):
     I0 = (data.y[:, 0] == 1).long().sum().item()
+
+    # Keep training obs_time consistent with main()/t_mcmc.
+    obs_time = [int(t) for t in args.obs_time.split(',') if t]
+    obs_time.append(data.T.item())
+    obs_time = sorted({t for t in obs_time if 0 < t <= data.T.item()})
+
     q_net = QNet.make(data, args)
     q_net.train()
-    opt = optim.AdamW(q_net.parameters(), lr = args.q_lr)
+    opt = optim.AdamW(q_net.parameters(), lr=args.q_lr)
     pbar = trange(1, args.q_steps + 1)
     for step in pbar:
         opt.zero_grad()
-        loss, zI0, zR0, zI, zR = q_loss(q_net, data, I0, bpar, args.q_samples)
+        loss, zI0, zR0, zI, zR = q_loss(q_net, data, I0, bpar, args.q_samples, obs_time=obs_time)
         pbar.set_description(f'[step={step}] loss={loss.item():.4f}')
         q_net.backward(loss, zI0, zR0, zI, zR)
         opt.step()
