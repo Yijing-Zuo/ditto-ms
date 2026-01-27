@@ -115,10 +115,11 @@ class QNet(nn.Module):
             msk_opt = msk_u & opt # (samples,)
             lik = lik + torch.where(msk_opt, torch.where(y0 == SIR_STATES.S, lI1, lI0), self.zero)
             trs = (y0.gather(dim = 0, index = u.unsqueeze(dim=0)).squeeze(dim=0) == SIR_STATES.S)  # (samples,)
-            rem = rem - torch.zeros_like(rem).index_put(
-                (self.eidx[1, :, None].expand(-1, n_samples).flatten(), cols[None].expand(self.n_edges, -1).flatten()),
-                ((msk_u & trs) & (self.eidx[0, :, None] == u)).flatten().long(), # (edges * samples,)
-                accumulate = False)
+            rem = rem - (torch.sparse.mm(self.adj, torch.zeros(rem.size(), dtype=self.adj.dtype, device=rem.device).scatter(dim = 0, index = u.unsqueeze(dim=0), src = (msk_u & trs).unsqueeze(dim=0).to(self.adj.dtype))) > 0).to(rem.dtype) # (nodes, samples)
+            # rem = rem - torch.zeros_like(rem).index_put(
+            #     (self.eidx[1, :, None].expand(-1, n_samples).flatten(), cols[None].expand(self.n_edges, -1).flatten()),
+            #     ((msk_u & trs) & (self.eidx[0, :, None] == u)).flatten().long(), # (edges * samples,)
+            #     accumulate = False)
             rem = rem.index_put((u, cols), torch.where(msk_u, torch.where(trs, rem_u - 1, self.n_inf), rem.gather(dim = 0, index = u.unsqueeze(dim=0)).squeeze(dim=0)))
             msk = msk.index_put((u, cols), msk_opt)
         return lik
