@@ -13,12 +13,7 @@ import torch.optim as optim
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
-try:
-    # Multi-snapshot tester (recommended).
-    from inc.test_ms import Tester
-except Exception:
-    # Fall back to single-snapshot tester if needed.
-    from inc.test import Tester
+from inc.test import Tester
 
 from tqdm import trange
 

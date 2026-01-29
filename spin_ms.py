@@ -513,10 +513,7 @@ import torch
 
 from inc.diffus import *
 
-try:
-    from inc.test_ms import Tester  # type: ignore
-except Exception:
-    from inc.test import Tester  # type: ignore
+from inc.test import Tester  # type: ignore
 
 
 def get_args():

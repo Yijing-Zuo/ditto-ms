@@ -12,9 +12,7 @@ from tsl.nn.models.stgn import GRINModel
 # Project utilities (same style as other runners)
 from inc.diffus import SIR_STATES, b_estim, diffus_gen, seed_all
 
-# Multi-snapshot aware tester (only evaluates on unobserved positions)
-# If your repo uses inc.test as the ms tester, you can swap this import accordingly.
-from inc.test_ms import Tester
+from inc.test import Tester
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -121,7 +121,16 @@ class QNet(nn.Module):
                     rem.flatten()[vids] = torch.where(mski.repeat_interleave(repeats = degi), torch.where(trsi.repeat_interleave(repeats = degi), rems - 1, self.n_inf), rems) # (T * sum neighbs)
                     mskI[uidi] &= opti # (T * samples)
         # likR + likI
-        lik = (torch.where(mskR, torch.where(trsR, lR1, lR0), self.zero).view(-1, n_samples) + torch.where(mskI.view(-1, n_samples), torch.where(trsI.view(-1, n_samples), lI1.view(-1, n_samples), lI0.view(-1, n_samples)), self.zero)).sum(dim = 0) # (samples,)
+        likR = torch.where(mskR, torch.where(trsR, lR1, lR0), self.zero).reshape(-1, n_samples)
+
+        mskI2 = mskI.reshape(-1, n_samples)
+        trsI2 = trsI.reshape(-1, n_samples)
+        lI1_2 = lI1.reshape(-1, n_samples)
+        lI0_2 = lI0.reshape(-1, n_samples)
+
+        likI = torch.where(mskI2, torch.where(trsI2, lI1_2, lI0_2), self.zero)
+
+        lik = (likR + likI).sum(dim=0)
         return lik, zI0, zR0, zI, zR # (samples,)
     @torch.no_grad()
     def clamp_grad(self, z0, grad):
