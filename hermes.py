@@ -311,7 +311,7 @@ def t_mcmc(data, bpar, q_net, args, obs_time, keepdim=True):
 
         # Hastings acceptance
         a = torch.rand(args.t_samples, device=args.device) <= torch.exp(lpY + lqX - lpX - lqY)
-
+        pbar.set_description(f"[step={step}] acc={a.float().mean().item():.3f}")
         X = torch.where(a, Y, X)
         lqX = torch.where(a, lqY, lqX)
         lpX = torch.where(a, lpY, lpX)
