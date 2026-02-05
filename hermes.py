@@ -346,12 +346,6 @@ def main(data):
         y_pred = y_pred[:, : data.T.item()].cummax(dim = 1).values
         return y_pred
 
-def cli_main():
-    global args
-    args = get_args()
-    tester = Tester(args.data_dir, args.device, main)
-    tester.test([args.dataset], seed=args.seed, rep=1)
-    tester.save(args.output)
-
-if __name__ == "__main__":
-    cli_main()
+args = get_args()
+tester = Tester(args.data_dir, args.device, main)
+tester.test([args.dataset], seed = args.seed, rep = 1)
