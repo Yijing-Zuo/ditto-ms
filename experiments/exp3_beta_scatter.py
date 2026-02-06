@@ -20,7 +20,7 @@ Baseline (NOT plotted):
 
 Run from repo root (example):
     python experiments/exp3_beta_scatter.py --dataset ba-si --data_dir input --device cuda \
-        --trials 50 --T 10 --beta_min 0.02 --beta_max 0.25 --b_steps 300
+        --trials 300 --T 10 --beta_min 0.02 --beta_max 0.25 --b_steps 300
 
 Outputs:
     - CSV:  output/exp3_beta_scatter/points.csv
@@ -122,26 +122,55 @@ def save_points_csv(path: str, rows: List[Dict[str, Any]]) -> None:
             w.writerow({k: r.get(k, "") for k in fieldnames})
 
 
-def plot_scatter(path_png: str, xs: np.ndarray, ys: np.ndarray, beta_min: float, beta_max: float, title: str) -> None:
-    _ensure_dir(os.path.dirname(path_png))
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
 
-    # diagonal range
-    lo = min(beta_min, float(xs.min()), float(ys.min()))
-    hi = max(beta_max, float(xs.max()), float(ys.max()))
+def plot_scatter(beta_true, beta_hat, T, obs_time, out_png, rmse=None):
+
+    mpl.rcParams.update({
+        "font.size": 11,
+        "axes.labelsize": 13,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "axes.linewidth": 1.0,
+    })
+
+    beta_true = np.asarray(beta_true)
+    beta_hat  = np.asarray(beta_hat)
+
+    lo = float(min(beta_true.min(), beta_hat.min()))
+    hi = float(max(beta_true.max(), beta_hat.max()))
     pad = 0.02 * (hi - lo + 1e-12)
     lo, hi = lo - pad, hi + pad
 
-    plt.figure(figsize=(5.2, 5.0))
-    plt.scatter(xs, ys, s=18, alpha=0.8)
-    plt.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1.2)
-    plt.xlim(lo, hi)
-    plt.ylim(lo, hi)
-    plt.xlabel(r"True $\beta$")
-    plt.ylabel(r"Estimated $\hat{\beta}$")
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(path_png, dpi=200)
-    plt.close()
+    fig, ax = plt.subplots(figsize=(3.2, 3.2), dpi=300)
+
+    ax.scatter(beta_true, beta_hat,
+               s=10, alpha=0.65, linewidths=0)  # s/alpha 你可微调
+
+
+    ax.plot([lo, hi], [lo, hi], linestyle="--", color="0.4", linewidth=1.2)
+
+    ax.set_xlabel(r"$\beta$")
+    ax.set_ylabel(r"$\hat{\beta}$")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+
+
+    ax.set_aspect("equal", adjustable="box")
+
+
+    info = fr"$T={T}$, obs={obs_time}"
+    if rmse is not None:
+        info += fr"\nRMSE={rmse:.4f}"
+    ax.text(0.05, 0.95, info, transform=ax.transAxes,
+            ha="left", va="top", fontsize=10)
+
+    fig.tight_layout(pad=0.2)
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
 
 
 def main() -> None:
@@ -170,8 +199,8 @@ def main() -> None:
                    help="initial beta guess in b_estim")
     p.add_argument("--b_pR0", type=float, default=0.0,
                    help="ignored for SI (kept for compatibility)")
-    p.add_argument("--b_steps", type=int, default=300)
-    p.add_argument("--b_lr", type=float, default=0.01)
+    p.add_argument("--b_steps", type=int, default=2000)
+    p.add_argument("--b_lr", type=float, default=0.001)
 
     # output
     p.add_argument("--out_dir", type=str, default="output/exp3_beta_scatter")
