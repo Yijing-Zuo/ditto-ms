@@ -24,12 +24,19 @@ def diffus_sim(edge_index, y0, WI, WR = None): # y0: (nodes, samples); WI: (T, e
 @torch.no_grad()
 def diffus_gen(T, n_nodes, edge_index, I0, n_samples, pI, pR):
     n_edges = edge_index.size(dim = 1)
-    idx = torch.ones(n_samples, n_nodes, device = edge_index.device).multinomial(I0, replacement = False).T # (I0, samples)
     y0 = torch.full((n_nodes, n_samples), SIR_STATES.S, dtype = torch.long, device = edge_index.device)
-    y0.scatter_(index = idx, dim = 0, src = torch.full_like(idx, SIR_STATES.I))
+    if I0 > 0:
+        idx = torch.ones(n_samples, n_nodes, device = edge_index.device).multinomial(I0, replacement = False).T # (I0, samples)
+        y0.scatter_(index = idx, dim = 0, src = torch.full_like(idx, SIR_STATES.I))
     WI = (torch.rand(T, n_edges, n_samples, device = y0.device) < pI).long()
     WR = (torch.rand(T, n_nodes, n_samples, device = y0.device) < pR).long() if pR > 0 else None
     return diffus_sim(edge_index, y0, WI, WR) # (T+1, nodes, samples)
+def resolve_assumed_I0(data, assumed_I0 = None):
+    if assumed_I0 is None:
+        I0 = (data.y[:, 0] == SIR_STATES.I).long().sum().item()
+    else:
+        I0 = int(assumed_I0)
+    return max(0, min(int(data.num_nodes), I0))
 
 def diffus_liks(Y, edge_index, I0, coef, pI, pR): # Y: (T+1, nodes, samples) # assuming Y feasible
     log1pI = torch_log(1. - pI) if isinstance(pI, torch.Tensor) else math_log(1. - pI)
@@ -62,9 +69,9 @@ class BPar(nn.Module):
     def dict(self):
         return Dict(pI = self.pI.item(), pR = self.pR.item())
 
-def _mf_init_from_prior(data, n_nodes, device):
+def _mf_init_from_prior(data, n_nodes, device, assumed_I0 = None):
     # prior: only use I0 count (same as current code)
-    I0 = (data.y[:, 0] == SIR_STATES.I).sum()
+    I0 = resolve_assumed_I0(data, assumed_I0)
     lI = torch.full((n_nodes,), I0 / n_nodes, dtype=torch.float, device=device)
     lS = torch.full((n_nodes,), 1. - I0 / n_nodes, dtype=torch.float, device=device)
     lR = torch.zeros(n_nodes, dtype=torch.float, device=device)
@@ -77,7 +84,7 @@ def _mf_init_from_snapshot(y, device):
     lR = (y == SIR_STATES.R).float().to(device)
     return lS, lI, lR
 
-def b_lik(bpar, data, obs_time=None):
+def b_lik(bpar, data, obs_time=None, assumed_I0 = None):
     device = data.y.device
     n_nodes = data.num_nodes
     T = data.T.item()
@@ -92,7 +99,7 @@ def b_lik(bpar, data, obs_time=None):
         obs_time.append(T)
 
     # -------- segmented mean-field --------
-    lS, lI, lR = _mf_init_from_prior(data, n_nodes, device)
+    lS, lI, lR = _mf_init_from_prior(data, n_nodes, device, assumed_I0 = assumed_I0)
     t_prev = 0
     lik_total = 0.0
 
@@ -125,7 +132,7 @@ def b_lik(bpar, data, obs_time=None):
     lik_total = lik_total / len(obs_time)
     return lik_total
 
-def b_estim(data, args, obs_time=None):
+def b_estim(data, args, obs_time=None, assumed_I0 = None):
     T = data.T.item()
     n_cls = data.y[:, T].max().item() + 1
     pI, pR = args.b_pI0, (args.b_pR0 if n_cls == 3 else 0.)
@@ -136,6 +143,8 @@ def b_estim(data, args, obs_time=None):
         tmp = [int(t) for t in str(args.obs_time).split(',') if t]
         tmp.append(T)
         obs_time = tmp
+    if assumed_I0 is None and hasattr(args, 'assumed_I0'):
+        assumed_I0 = args.assumed_I0
 
     bpar = BPar(pI=pI, pR=pR, device=device)
     bpar.train()
@@ -144,7 +153,7 @@ def b_estim(data, args, obs_time=None):
 
     for step in pbar:
         opt.zero_grad()
-        loss = -b_lik(bpar, data, obs_time=obs_time)
+        loss = -b_lik(bpar, data, obs_time=obs_time, assumed_I0 = assumed_I0)
         loss.backward()
         opt.step()
         bpar.clamp_()

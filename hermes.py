@@ -27,6 +27,8 @@ def get_args():
     parser.add_argument('--t_steps', type = int, help = 'MCMC steps')
     parser.add_argument('--t_keep', type = float, help = 'moving average in MCMC')
     parser.add_argument('--obs_time', type = str, default = '', help = 'extra observed snapshot times, comma-separated, e.g., 5,7,9')
+    parser.add_argument('--assumed_I0', type=int, default=None,
+                        help='assumed initial infected count; default uses the current behavior (true I0 from data)')
     args = parser.parse_args()
     return args
 
@@ -274,8 +276,8 @@ def q_loss(q_net, data, I0, bpar, n_samples, obs_time):
     q_liks, zI0, zR0, zI, zR = q_net.lik_ms(Y=Y, obs_time=obs_time)
     return -q_liks.mean(), zI0, zR0, zI, zR
 
-def q_train(data, obs_time, bpar, args):
-    I0 = (data.y[:, 0] == 1).long().sum().item()
+def q_train(data, obs_time, bpar, args, assumed_I0 = None):
+    I0 = resolve_assumed_I0(data, getattr(args, 'assumed_I0', None) if assumed_I0 is None else assumed_I0)
     q_net = QNet.make(data, obs_time, args)
     q_net.train()
     opt = optim.AdamW(q_net.parameters(), lr=args.q_lr)
@@ -290,9 +292,12 @@ def q_train(data, obs_time, bpar, args):
     return q_net
 
 @torch.no_grad()
-def t_mcmc(data, bpar, q_net, args, obs_time, keepdim=True):
+def t_mcmc(data, bpar, q_net, args, obs_time, keepdim=True, assumed_I0=None, diagnostics=False):
 
-    I0 = (data.y[:, 0] == 1).long().sum().item()
+    I0 = resolve_assumed_I0(
+        data,
+        getattr(args, 'assumed_I0', None) if assumed_I0 is None else assumed_I0
+    )
 
     obs_time = sorted(list(obs_time))
     y_obs = torch.stack([data.y[:, t : t + 1] for t in obs_time], dim=2)  # (nodes, 1, obs)
@@ -304,6 +309,8 @@ def t_mcmc(data, bpar, q_net, args, obs_time, keepdim=True):
     tI_avg = data_make_t(X, SIR_STATES.I, dim=0).float().mean(dim=1, keepdim=keepdim)
     tR_avg = data_make_t(X, SIR_STATES.R, dim=0).float().mean(dim=1, keepdim=keepdim)
 
+    diag_rows = [] if diagnostics else None
+
     pbar = trange(1, args.t_steps + 1)
     for step in pbar:
         Y, lqY = q_net.samp_ms(data.y, zI, zR, args.t_samples, obs_time=obs_time, compute_lik=True)
@@ -311,7 +318,9 @@ def t_mcmc(data, bpar, q_net, args, obs_time, keepdim=True):
 
         # Hastings acceptance
         a = torch.rand(args.t_samples, device=args.device) <= torch.exp(lpY + lqX - lpX - lqY)
-        pbar.set_description(f"[step={step}] acc={a.float().mean().item():.3f}")
+        acc = a.float().mean().item()
+        pbar.set_description(f"[step={step}] acc={acc:.3f}")
+
         X = torch.where(a, Y, X)
         lqX = torch.where(a, lqY, lqX)
         lpX = torch.where(a, lpY, lpX)
@@ -321,31 +330,54 @@ def t_mcmc(data, bpar, q_net, args, obs_time, keepdim=True):
         tI_avg = args.t_keep * tI_avg + (1.0 - args.t_keep) * tI
         tR_avg = args.t_keep * tR_avg + (1.0 - args.t_keep) * tR
 
-    return tI_avg, tR_avg
+        if diagnostics:
+            diag_rows.append(dict(
+                step=int(step),
+                accept_rate=float(acc),
+                mean_tI=float(tI.mean().item()),
+                mean_tR=float(tR.mean().item()),
+                mean_tI_avg=float(tI_avg.mean().item()),
+                mean_tR_avg=float(tR_avg.mean().item()),
+                mean_lp=float(lpX.mean().item()),
+            ))
 
-def main(data):
+    if diagnostics:
+        return tI_avg, tR_avg, diag_rows
+    return tI_avg, tR_avg
+def run_hermes(data, args, assumed_I0 = None, return_extra = False):
     # parse obs times
     obs_time = [int(t) for t in args.obs_time.split(',') if t]
     obs_time.append(data.T.item())
     obs_time = sorted(set(obs_time))
+    assumed_I0 = resolve_assumed_I0(data, getattr(args, 'assumed_I0', None) if assumed_I0 is None else assumed_I0)
+
     # estimate diffusion parameters
-    bpar = b_estim(data, args)
+    bpar = b_estim(data, args, obs_time = obs_time, assumed_I0 = assumed_I0)
     print(f'[est] pI={bpar.pI:.4f}, pR={bpar.pR:.4f}', flush = True)
+
     # train a proposal network
-    q_net = q_train(data, obs_time, bpar, args)
+    q_net = q_train(data, obs_time, bpar, args, assumed_I0 = assumed_I0)
+
     # estimate transition times
-    tI, tR = t_mcmc(data, bpar, q_net, args, obs_time = obs_time, keepdim = True) # (nodes, 1)
-    T = data.T.item()
+    tI, tR = t_mcmc(data, bpar, q_net, args, obs_time = obs_time, keepdim = True, assumed_I0 = assumed_I0) # (nodes, 1)
+
     tI = tI.round().long()
     tR = tR.round().long()
+
     # compose a history
     with torch.no_grad():
         y_pred = torch.zeros_like(data.y) # (nodes, T+1)
         y_pred.scatter_(dim = 1, index = torch.minimum(tI, data.T), src = torch.full_like(tI, 1))
         y_pred.scatter_(dim = 1, index = torch.minimum(tR, data.T), src = torch.full_like(tR, 2))
         y_pred = y_pred[:, : data.T.item()].cummax(dim = 1).values
+        if return_extra:
+            return y_pred, Dict(assumed_I0 = assumed_I0, pI = bpar.pI, pR = bpar.pR)
         return y_pred
 
-args = get_args()
-tester = Tester(args.data_dir, args.device, main)
-tester.test([args.dataset], seed = args.seed, rep = 1)
+def main(data):
+    return run_hermes(data, args)
+
+if __name__ == '__main__':
+    args = get_args()
+    tester = Tester(args.data_dir, args.device, main)
+    tester.test([args.dataset], seed = args.seed, rep = 1)
