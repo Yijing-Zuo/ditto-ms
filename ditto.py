@@ -226,26 +226,39 @@ def t_mcmc(data, bpar, q_net, args, keepdim = True):
         tR_avg = args.t_keep * tR_avg + (1. - args.t_keep) * tR # (nodes, 1)
     return tI_avg, tR_avg # (nodes, 1)
 
-def main(data):
+def run_ditto_on_data(data, args):
     # estimate diffusion parameters
     bpar = b_estim(data, args)
     print(f'[est] pI={bpar.pI:.4f}, pR={bpar.pR:.4f}', flush = True)
+
     # train a proposal network
     q_net = q_train(data, bpar, args)
+
     # estimate transition times
-    tI, tR = t_mcmc(data, bpar, q_net, args, keepdim = True) # (nodes, 1)
-    T = data.T.item()
+    tI, tR = t_mcmc(data, bpar, q_net, args, keepdim = True)  # (nodes, 1)
     tI = tI.round().long()
     tR = tR.round().long()
+
     # compose a history
     with torch.no_grad():
-        y_pred = torch.zeros_like(data.y) # (nodes, T+1)
+        y_pred = torch.zeros_like(data.y)  # (nodes, T+1)
         y_pred.scatter_(dim = 1, index = torch.minimum(tI, data.T), src = torch.full_like(tI, 1))
         y_pred.scatter_(dim = 1, index = torch.minimum(tR, data.T), src = torch.full_like(tR, 2))
         y_pred = y_pred[:, : data.T.item()].cummax(dim = 1).values
         return y_pred
 
-args = get_args()
-tester = Tester(args.data_dir, args.device, main)
-tester.test([args.dataset], seed = args.seed, rep = 1)
-tester.save(args.output)
+
+def main(data):
+    return run_ditto_on_data(data, args)
+
+
+if __name__ == '__main__':
+    args = get_args()
+    if args.device is None:
+        args.device = torch_device()
+
+    tester = Tester(args.data_dir, args.device, main)
+    tester.test([args.dataset], seed = args.seed, rep = 1)
+
+    if args.output is not None:
+        tester.save(args.output)
