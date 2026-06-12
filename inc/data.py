@@ -2,7 +2,6 @@ from inc.diffus import *
 
 def data_make_t(y, x, dim = -1):
     return torch.where(*(y == x).max(dim), y.size(dim))
-
 def data_simulate(Gnx, seed, T, diffus, params):
     sir = (diffus == 'sir')
     cfg = ndmc.Configuration()
@@ -67,7 +66,7 @@ def data_synthetic(graph, diffus, data_dir, device):
     data_dir = osp.join(data_dir, 'synthetic')
     f_data = osp.join(data_dir, f'{graph}-{diffus}.pt')
     if osp.exists(f_data):
-        return torch.load(f_data, map_location = device)
+        return torch.load(f_data, map_location=device, weights_only=False)
     else:
         seed = 123456789
         T = 10
@@ -89,7 +88,7 @@ def data_prost(diffus, data_dir, device):
     data_dir = osp.join(data_dir, 'prost')
     f_data = osp.join(data_dir, f'prost-{diffus}.pt')
     if osp.exists(f_data):
-        return torch.load(f_data, map_location = device)
+        return torch.load(f_data, map_location=device, weights_only=False)
     else:
         seed = 123456789
         T = 15
@@ -111,7 +110,7 @@ def data_oregon2(diffus, data_dir, device):
     data_dir = osp.join(data_dir, 'oregon2')
     f_data = osp.join(data_dir, f'oregon2-{diffus}.pt')
     if osp.exists(f_data):
-        return torch.load(f_data, map_location = device)
+        return torch.load(f_data, map_location=device, weights_only=False)
     else:
         seed = 123456789
         T = 15
@@ -131,7 +130,7 @@ def data_farmers_si(data_dir, device):
     data_dir = osp.join(data_dir, 'farmers')
     f_data = osp.join(data_dir, 'farmers-si.pt')
     if osp.exists(f_data):
-        return torch.load(f_data, map_location = device)
+        return torch.load(f_data, map_location=device, weights_only=False)
     else:
         f_raw = file_require(None, data_dir, 'brfarmers.rdata')
         df = pyreadr.read_r('farmers/brfarmers.rdata')['brfarmers']
@@ -161,7 +160,7 @@ def data_pol_si(data_dir, device):
     data_dir = osp.join(data_dir, 'pol')
     f_data = osp.join(data_dir, 'pol-si.pt')
     if osp.exists(f_data):
-        return torch.load(f_data, map_location = device)
+        return torch.load(f_data, map_location=device, weights_only=False)
     else:
         f_edge = file_require('https://nrvis.com/download/data/rt/rt-pol.zip', data_dir, 'rt-pol.txt', z = 'zip')
         df_fr, df_to, df_time = [], [], []
@@ -190,7 +189,7 @@ def data_covid_sir(data_dir, device):
     data_dir = osp.join(data_dir, 'covid')
     f_data = osp.join(data_dir, 'covid-sir.pt')
     if osp.exists(f_data):
-        return torch.load(f_data, map_location = device)
+        return torch.load(f_data, map_location=device, weights_only=False)
     else:
         COVID_KNN = 10
         f_s2a = file_require(None, data_dir, 'state2abbr.pyon')
@@ -251,7 +250,7 @@ def data_heb_sir(data_dir, device):
     data_dir = osp.join(data_dir, 'heb')
     f_data = osp.join(data_dir, 'heb-sir.pt')
     if osp.exists(f_data):
-        return torch.load(f_data, map_location = device)
+        return torch.load(f_data, map_location=device, weights_only=False)
     else:
         f_edge = file_require(url = None, fdir = data_dir, fname = 'DS1_NON_VIRAL_Gtw.tsv')
         df = pd.read_csv(f_edge, sep = '\t', header = None, names = ['time', 'to', 'fr'], dtype = dict(time = str, to = int, fr = int), parse_dates = ['time'])

@@ -121,7 +121,16 @@ class QNet(nn.Module):
                     rem.flatten()[vids] = torch.where(mski.repeat_interleave(repeats = degi), torch.where(trsi.repeat_interleave(repeats = degi), rems - 1, self.n_inf), rems) # (T * sum neighbs)
                     mskI[uidi] &= opti # (T * samples)
         # likR + likI
-        lik = (torch.where(mskR, torch.where(trsR, lR1, lR0), self.zero).view(-1, n_samples) + torch.where(mskI.view(-1, n_samples), torch.where(trsI.view(-1, n_samples), lI1.view(-1, n_samples), lI0.view(-1, n_samples)), self.zero)).sum(dim = 0) # (samples,)
+        likR = torch.where(mskR, torch.where(trsR, lR1, lR0), self.zero).reshape(-1, n_samples)
+
+        mskI2 = mskI.reshape(-1, n_samples)
+        trsI2 = trsI.reshape(-1, n_samples)
+        lI1_2 = lI1.reshape(-1, n_samples)
+        lI0_2 = lI0.reshape(-1, n_samples)
+
+        likI = torch.where(mskI2, torch.where(trsI2, lI1_2, lI0_2), self.zero)
+
+        lik = (likR + likI).sum(dim=0)
         return lik, zI0, zR0, zI, zR # (samples,)
     @torch.no_grad()
     def clamp_grad(self, z0, grad):
@@ -217,26 +226,39 @@ def t_mcmc(data, bpar, q_net, args, keepdim = True):
         tR_avg = args.t_keep * tR_avg + (1. - args.t_keep) * tR # (nodes, 1)
     return tI_avg, tR_avg # (nodes, 1)
 
-def main(data):
+def run_ditto_on_data(data, args):
     # estimate diffusion parameters
     bpar = b_estim(data, args)
     print(f'[est] pI={bpar.pI:.4f}, pR={bpar.pR:.4f}', flush = True)
+
     # train a proposal network
     q_net = q_train(data, bpar, args)
+
     # estimate transition times
-    tI, tR = t_mcmc(data, bpar, q_net, args, keepdim = True) # (nodes, 1)
-    T = data.T.item()
+    tI, tR = t_mcmc(data, bpar, q_net, args, keepdim = True)  # (nodes, 1)
     tI = tI.round().long()
     tR = tR.round().long()
+
     # compose a history
     with torch.no_grad():
-        y_pred = torch.zeros_like(data.y) # (nodes, T+1)
+        y_pred = torch.zeros_like(data.y)  # (nodes, T+1)
         y_pred.scatter_(dim = 1, index = torch.minimum(tI, data.T), src = torch.full_like(tI, 1))
         y_pred.scatter_(dim = 1, index = torch.minimum(tR, data.T), src = torch.full_like(tR, 2))
         y_pred = y_pred[:, : data.T.item()].cummax(dim = 1).values
         return y_pred
 
-args = get_args()
-tester = Tester(args.data_dir, args.device, main)
-tester.test([args.dataset], seed = args.seed, rep = 1)
-tester.save(args.output)
+
+def main(data):
+    return run_ditto_on_data(data, args)
+
+
+if __name__ == '__main__':
+    args = get_args()
+    if args.device is None:
+        args.device = torch_device()
+
+    tester = Tester(args.data_dir, args.device, main)
+    tester.test([args.dataset], seed = args.seed, rep = 1)
+
+    if args.output is not None:
+        tester.save(args.output)

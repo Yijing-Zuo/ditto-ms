@@ -1,0 +1,8 @@
+name: ditto-gpu
+channels:
+  - defaults
+dependencies:
+  - python=3.11.14
+  - pip
+  - git
+prefix: C:\Users\z1585\anaconda3\envs\ditto-gpu
